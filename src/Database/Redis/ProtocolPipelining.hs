@@ -99,17 +99,20 @@ request conn req = send conn req >> recv conn
 --  to call 'hFlush' here. The list constructor '(:)' must be called from
 --  /within/ unsafeInterleaveIO, to keep the replies in correct order.
 hGetReplies :: Handle -> Parser a -> (a -> IO ()) -> IO ()
-hGetReplies h parser yield =
-    go S.empty
+hGetReplies h parser0 yield =
+    go1 (parse parser0)
   where
-    go rest = do
-        parseResult <- parseWith readMore parser rest
-        case parseResult of
-            Fail{}       -> error "Hedis: parse failure"
-            Partial{}    -> error "Hedis: parseWith returned Partial"
-            Done rest' r -> do
+    go1 parser = do
+        bs <- readMore
+        unless (S.null bs) $ go2 parser bs
+
+    go2 parser bs =
+        case parser bs of
+            Fail _ x y -> error $ "Hedis: parse failure: " ++ show (x, y)
+            Partial parser' -> go1 parser'
+            Done bs' r -> do
                 yield r
-                go rest'
+                go2 (parse parser0) bs'
 
     readMore = do
         hFlush h -- send any pending requests
