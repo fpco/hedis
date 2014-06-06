@@ -42,17 +42,16 @@ import           Data.IORef
 import           Data.Typeable
 import           Network
 import           System.IO
+import           System.IO.Error (isEOFError)
 import           System.IO.Unsafe
 
 
 data Connection a = Conn
     { connHandle   :: Handle        -- ^ Connection socket-handle.
-    , connReplies  :: IORef [a]     -- ^ Reply thunks.
-    , connThunks   :: BoundedChan a -- ^ See note [Eval thread synchronization].
-    , connEvalTId  :: ThreadId      -- ^ 'ThreadID' of the eval thread.
+    , connOutput   :: BoundedChan a -- ^ See note [Eval thread synchronization].
     }
 
-data ConnectionLostException = ConnectionLost
+data ConnectionLostException = ConnectionLost IOException
     deriving (Show, Typeable)
 
 instance Exception ConnectionLostException
@@ -65,17 +64,12 @@ connect
 connect host port parser = do
     connHandle  <- connectTo host port
     hSetBinaryMode connHandle True
-    rs          <- hGetReplies connHandle parser
-    connReplies <- newIORef rs
-    connThunks  <- newBoundedChan 1000
-    connEvalTId <- forkIO $ forever $ readChan connThunks >>= evaluate
+    connOutput  <- newBoundedChan 1000
+    _ <- forkIO $ hGetReplies connHandle parser (writeChan connOutput)
     return Conn{..}
 
 disconnect :: Connection a -> IO ()
-disconnect Conn{..} = do
-    open <- hIsOpen connHandle
-    when open (hClose connHandle)
-    killThread connEvalTId
+disconnect = hClose . connHandle
 
 -- |Write the request to the socket output buffer.
 --
@@ -89,12 +83,7 @@ send Conn{..} = S.hPut connHandle
 --  would block until a reply can be read. Using 'head' and 'tail' achieves ~2%
 --  more req/s in pipelined code than a lazy pattern match @~(r:rs)@.
 recv :: Connection a -> IO a
-recv Conn{..} = do
-    rs <- readIORef connReplies
-    writeIORef connReplies (tail rs)
-    let r = head rs
-    writeChan connThunks r
-    return r
+recv = readChan . connOutput
 
 request :: Connection a -> S.ByteString -> IO a
 request conn req = send conn req >> recv conn
@@ -109,24 +98,24 @@ request conn req = send conn req >> recv conn
 --  thread-safe. 'Handle' as implemented by GHC is also threadsafe, it is safe
 --  to call 'hFlush' here. The list constructor '(:)' must be called from
 --  /within/ unsafeInterleaveIO, to keep the replies in correct order.
-hGetReplies :: Handle -> Parser a -> IO [a]
-hGetReplies h parser = go S.empty
+hGetReplies :: Handle -> Parser a -> (a -> IO ()) -> IO ()
+hGetReplies h parser yield =
+    go S.empty
   where
-    go rest = unsafeInterleaveIO $ do        
+    go rest = do
         parseResult <- parseWith readMore parser rest
         case parseResult of
-            Fail{}       -> errConnClosed
+            Fail{}       -> error "Hedis: parse failure"
             Partial{}    -> error "Hedis: parseWith returned Partial"
             Done rest' r -> do
-                rs <- go rest'
-                return (r:rs)
+                yield r
+                go rest'
 
     readMore = do
         hFlush h -- send any pending requests
-        S.hGetSome h maxRead `catchIOError` const errConnClosed
+        S.hGetSome h maxRead `catch` errConnClosed
 
     maxRead       = 4*1024
-    errConnClosed = throwIO ConnectionLost
-
-    catchIOError :: IO a -> (IOError -> IO a) -> IO a
-    catchIOError = catch
+    errConnClosed e
+        | isEOFError e = return S.empty
+        | otherwise    = throwIO (ConnectionLost e)
