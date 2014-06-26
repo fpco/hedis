@@ -121,4 +121,8 @@ hGetReplies h parser0 yield =
     maxRead       = 4*1024
     errConnClosed e
         | isEOFError e = return S.empty
-        | otherwise    = throwIO (ConnectionLost e)
+        | otherwise    = do
+            closed <- hIsClosed h
+            if closed
+                then return S.empty
+                else throwIO (ConnectionLost e)
